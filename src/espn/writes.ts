@@ -10,6 +10,8 @@ export interface WriteOutcome<T> {
   sent?: Record<string, unknown>;
   response?: { status: number; body: unknown };
   verification?: T;
+  /** Non-empty only when an executed write's read-back still disagrees with what was sent after settling. */
+  verifyMismatches?: string[];
   blockedReason?: string;
 }
 
@@ -22,10 +24,89 @@ async function currentScoringPeriod(p: LeagueParams): Promise<number> {
   return league.currentScoringPeriod ?? 1;
 }
 
-async function teamRoster(p: LeagueParams, teamId: number): Promise<NormalizedPlayer[]> {
-  const rosters = await getRosters(p, teamId);
+async function teamRoster(p: LeagueParams, teamId: number, asOfPeriod?: number): Promise<NormalizedPlayer[]> {
+  const rosters = await getRosters(p, teamId, undefined, asOfPeriod);
   if (rosters.length === 0) throw new Error(`No roster found for team ${teamId}.`);
   return rosters[0].players;
+}
+
+// ---------------------------------------------------------------------------
+// read-back verification
+// ---------------------------------------------------------------------------
+
+/** Did the roster read back after a lineup write land where the moves sent it? */
+export function lineupMismatches(roster: NormalizedPlayer[], moves: LineupMove[]): string[] {
+  const bySlot = new Map(roster.map((pl) => [pl.id, pl.lineupSlotId]));
+  const out: string[] = [];
+  for (const m of moves) {
+    if (!bySlot.has(m.playerId)) {
+      out.push(`player ${m.playerId}: intended slot ${m.toSlot}, but the player is not on the roster read back`);
+    } else if (bySlot.get(m.playerId) !== m.toSlot) {
+      out.push(`player ${m.playerId}: intended slot ${m.toSlot}, roster read-back shows slot ${bySlot.get(m.playerId)}`);
+    }
+  }
+  return out;
+}
+
+/** Minimal shape of one getPending() entry, just the fields the add/drop check needs. */
+export interface PendingTxLike {
+  teamId?: number;
+  type?: string;
+  items?: Array<{ type?: string; playerId?: number; toTeamId?: number }>;
+}
+
+/**
+ * Did an add/drop take? A FREEAGENT add executes immediately, so the receipt
+ * is the roster. A WAIVER claim waits for the waiver run, so the receipt is a
+ * matching pending entry (or the roster, if it already cleared).
+ */
+export function addDropMismatches(
+  opts: { type: "WAIVER" | "FREEAGENT"; teamId: number; addPlayerId: number; dropPlayerId?: number },
+  roster: NormalizedPlayer[],
+  pending: PendingTxLike[],
+): string[] {
+  const onRoster = new Set(roster.map((pl) => pl.id));
+  const addLanded = onRoster.has(opts.addPlayerId);
+  const dropLanded = opts.dropPlayerId === undefined || !onRoster.has(opts.dropPlayerId);
+  if (opts.type === "FREEAGENT") {
+    const out: string[] = [];
+    if (!addLanded) out.push(`player ${opts.addPlayerId}: add did not land, not on the roster read back`);
+    if (!dropLanded) out.push(`player ${opts.dropPlayerId}: drop did not land, still on the roster read back`);
+    return out;
+  }
+  if (addLanded && dropLanded) return [];
+  const pendingMatch = pending.some(
+    (t) =>
+      t.teamId === opts.teamId &&
+      t.type === "WAIVER" &&
+      (t.items || []).some((i) => i.type === "ADD" && i.playerId === opts.addPlayerId && i.toTeamId === opts.teamId),
+  );
+  return pendingMatch
+    ? []
+    : [`waiver claim for player ${opts.addPlayerId}: no matching pending entry and the roster read-back does not show it either`];
+}
+
+// ESPN's read side lags its write side: a roster read seconds (sometimes
+// minutes) after an executed write can still show the old state, so a single
+// immediate read-back reports a failure that did not happen. Re-read a few
+// times, spaced out, before reporting a mismatch. A real failure never
+// converges and is still reported; a lagging read stops being a false alarm.
+export const SETTLE_DELAYS_MS = [0, 3000, 8000, 15000];
+
+export async function settle<T>(
+  read: () => Promise<T>,
+  mismatches: (state: T) => string[],
+  delaysMs: number[] = SETTLE_DELAYS_MS,
+): Promise<{ state: T; mismatches: string[] }> {
+  let state = await read();
+  let m = mismatches(state);
+  for (const delay of delaysMs.slice(1)) {
+    if (m.length === 0) break;
+    await new Promise((r) => setTimeout(r, delay));
+    state = await read();
+    m = mismatches(state);
+  }
+  return { state, mismatches: m };
 }
 
 // ---------------------------------------------------------------------------
@@ -83,10 +164,23 @@ async function runAddDrop(
   }
 
   const result = await postTransaction(p.sport, p.season, p.leagueId, body);
-  const verification = { transactions: await import("./reads.js").then((m) => m.getPending(p)) };
-  const resolvedVerification = { transactions: await verification.transactions };
-  logWrite(toolName, args, body, result, resolvedVerification);
-  return { dryRun: false, sent: redactBody(body), response: redactResult(result), verification: resolvedVerification };
+  const { getPending } = await import("./reads.js");
+  const settled = await settle(
+    async () => {
+      const [pending, roster] = await Promise.all([getPending(p), teamRoster(p, opts.teamId)]);
+      return { pending, roster };
+    },
+    (s) => addDropMismatches(opts, s.roster, s.pending),
+  );
+  const verification = { transactions: settled.state.pending };
+  logWrite(toolName, args, body, result, verification);
+  return {
+    dryRun: false,
+    sent: redactBody(body),
+    response: redactResult(result),
+    verification,
+    verifyMismatches: settled.mismatches,
+  };
 }
 
 export async function waiverClaim(
@@ -184,16 +278,53 @@ export function buildLineupBody(opts: {
   };
 }
 
+/**
+ * The scoring period a lineup is written for. Omitted, it is ESPN's current
+ * period. A daily league (basketball, baseball) can pass a later period to set
+ * tomorrow's lineup tonight; with only the current period available, every
+ * player whose game had already started today read as locked for tomorrow too.
+ *
+ * Refused: a past period (over and locked), anything after the league's final
+ * period, a non-integer, and a league that reports no current period at all
+ * (rather than silently assuming period 1).
+ */
+export function resolveLineupPeriod(
+  requested: number | undefined,
+  current: number | undefined | null,
+  final: number | undefined | null,
+  where: string,
+): number {
+  if (current === undefined || current === null)
+    throw new Error(`${where} returned no status.latestScoringPeriod; refusing to build a lineup for an assumed period 1.`);
+  if (requested === undefined) return current;
+  if (!Number.isInteger(requested)) throw new Error(`scoring_period_id ${requested} is not a whole period.`);
+  if (requested < current)
+    throw new Error(`scoring_period_id ${requested} is before ESPN's current period ${current}; a past period is locked.`);
+  if (final !== undefined && final !== null && requested > final)
+    throw new Error(`scoring_period_id ${requested} is after the league's final period ${final}.`);
+  return requested;
+}
+
 export async function setLineup(
   p: LeagueParams,
-  args: { teamId: number; moves: LineupMove[] },
+  args: { teamId: number; moves: LineupMove[]; scoringPeriodId?: number },
   dryRun: boolean,
 ): Promise<WriteOutcome<{ roster: unknown }> & { validation: LineupValidationResult }> {
-  const [roster, league] = await Promise.all([teamRoster(p, args.teamId), getLeague(p)]);
+  const league = await getLeague(p);
+  const scoringPeriodId = resolveLineupPeriod(
+    args.scoringPeriodId,
+    league.currentScoringPeriod,
+    league.finalScoringPeriod,
+    `league ${p.leagueId} (${p.sport} ${p.season})`,
+  );
+  // ESPN answers mRoster per period, with that period's slots and lock flags.
+  // Only ask for a specific period when the caller named one, so the default
+  // path sends exactly the read it always did.
+  const asOf = args.scoringPeriodId !== undefined ? scoringPeriodId : undefined;
+  const roster = await teamRoster(p, args.teamId, asOf);
   const slotCounts = league.rosterSlotCounts ?? {};
   const validation = validateLineupMoves(p.sport, roster, args.moves, slotCounts);
   const currentSlots = new Map(roster.map((pl) => [pl.id, pl.lineupSlotId]));
-  const scoringPeriodId = league.currentScoringPeriod ?? 1;
 
   if (dryRun || !writesEnabled()) {
     const body = validation.valid
@@ -214,9 +345,17 @@ export async function setLineup(
   const body = buildLineupBody({ teamId: args.teamId, scoringPeriodId, moves: validation.accepted, currentSlots });
 
   const result = await postTransaction(p.sport, p.season, p.leagueId, body);
-  const verification = { roster: await teamRoster(p, args.teamId) };
+  const settled = await settle(() => teamRoster(p, args.teamId, asOf), (r) => lineupMismatches(r, validation.accepted));
+  const verification = { roster: settled.state };
   logWrite("set_lineup", { ...p, ...args }, body, result, verification);
-  return { dryRun: false, validation, sent: redactBody(body), response: redactResult(result), verification };
+  return {
+    dryRun: false,
+    validation,
+    sent: redactBody(body),
+    response: redactResult(result),
+    verification,
+    verifyMismatches: settled.mismatches,
+  };
 }
 
 export async function moveToIr(

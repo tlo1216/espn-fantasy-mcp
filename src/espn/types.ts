@@ -93,6 +93,7 @@ export interface EspnSettings {
 export interface EspnStatus {
   currentMatchupPeriod: number;
   latestScoringPeriod: number;
+  finalScoringPeriod?: number;
 }
 
 export interface EspnLeagueResponse {

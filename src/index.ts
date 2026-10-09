@@ -130,6 +130,7 @@ const getLeagueOutputSchema = {
   seasonId: z.number(),
   name: z.string().optional(),
   currentScoringPeriod: z.number().optional(),
+  finalScoringPeriod: z.number().optional(),
   currentMatchupPeriod: z.number().optional(),
   rosterSlotCounts: z.record(z.string(), z.number()).optional(),
   acquisitionSettings: passthroughObject,
@@ -223,6 +224,7 @@ function writeOutcomeOutputSchema(extra: Record<string, z.ZodTypeAny> = {}) {
     sent: passthroughObject,
     response: z.object({ status: z.number(), body: z.unknown() }).optional(),
     verification: z.unknown().optional(),
+    verifyMismatches: z.array(z.string()).optional(),
     blockedReason: z.string().optional(),
     ...extra,
   };
@@ -348,11 +350,12 @@ server.registerTool(
       ...leagueParamsShape,
       limit: z.number().int().min(1).max(200).default(50).describe("Max transactions to return."),
       offset: z.number().int().min(0).default(0).describe("Number to skip, for paging through more."),
+      scoring_period_id: z.number().int().min(1).optional().describe("Only this scoring period. Omit to read every period of the season so far."),
     },
     outputSchema: getTransactionsOutputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  (args) => tryCatch(() => getTransactions(toParams(args), { limit: args.limit, offset: args.offset })),
+  (args) => tryCatch(() => getTransactions(toParams(args), { limit: args.limit, offset: args.offset, scoringPeriodId: args.scoring_period_id })),
 );
 
 server.registerTool(
@@ -462,6 +465,9 @@ server.registerTool(
       ...leagueParamsShape,
       team_id: z.number().int().default(cfg.defaultTeamId ?? 0),
       moves: z.array(moveSchema).min(1),
+      scoring_period_id: z.number().int().min(1).optional().describe(
+        "Scoring period to set the lineup for (a day in basketball/baseball, a week in football). Omit for ESPN's current period. A later period sets a future day's lineup, e.g. tomorrow's tonight; locks and slots are read for that period. Past periods and periods after the league's last are refused.",
+      ),
       dry_run: dryRunSchema,
     },
     outputSchema: writeOutcomeOutputSchema({ validation: lineupValidationOutputSchema }),
@@ -471,7 +477,11 @@ server.registerTool(
     tryCatch(() =>
       setLineup(
         toParams(args),
-        { teamId: args.team_id, moves: args.moves.map((m) => ({ playerId: m.player_id, toSlot: m.to_slot })) },
+        {
+          teamId: args.team_id,
+          moves: args.moves.map((m) => ({ playerId: m.player_id, toSlot: m.to_slot })),
+          scoringPeriodId: args.scoring_period_id,
+        },
         args.dry_run,
       ),
     ),

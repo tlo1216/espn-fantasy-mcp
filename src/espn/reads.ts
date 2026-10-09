@@ -117,6 +117,7 @@ export async function getLeague(p: LeagueParams) {
     seasonId: data.seasonId,
     name: s?.name,
     currentScoringPeriod: data.status?.latestScoringPeriod,
+    finalScoringPeriod: data.status?.finalScoringPeriod,
     currentMatchupPeriod: data.status?.currentMatchupPeriod,
     rosterSlotCounts: s?.rosterSettings?.lineupSlotCounts,
     acquisitionSettings: s?.acquisitionSettings,
@@ -152,8 +153,11 @@ export async function getTeams(p: LeagueParams) {
 // get_rosters
 // ---------------------------------------------------------------------------
 
-export async function getRosters(p: LeagueParams, teamId?: number, periodId?: number) {
-  const data = await fetchLeague(p, ["mRoster", "mTeam"]);
+/** `asOfPeriod` asks ESPN for the roster as of that scoring period (its slots
+ *  and lineupLocked flags). Omitted, ESPN answers for its current period.
+ *  `periodId` only selects which period's stats are attached. */
+export async function getRosters(p: LeagueParams, teamId?: number, periodId?: number, asOfPeriod?: number) {
+  const data = await fetchLeague(p, ["mRoster", "mTeam"], asOfPeriod !== undefined ? { scoringPeriodId: asOfPeriod } : {});
   const teams = (data.teams || []).filter((t) => teamId === undefined || t.id === teamId);
   return teams.map((t) => ({
     teamId: t.id,
@@ -300,13 +304,29 @@ export interface TransactionsPage {
 
 export async function getTransactions(
   p: LeagueParams,
-  opts: { limit?: number; offset?: number } = {},
+  opts: { limit?: number; offset?: number; scoringPeriodId?: number } = {},
 ): Promise<TransactionsPage> {
   const limit = opts.limit ?? 50;
   const offset = opts.offset ?? 0;
 
-  const data = await fetchLeague(p, ["mTransactions2"]);
-  const all = ((data as unknown as { transactions?: EspnTransaction[] }).transactions || [])
+  // ESPN's mTransactions2 view returns only the current scoring period when no
+  // scoringPeriodId is passed, so earlier periods silently disappeared as soon
+  // as a period rolled over. Read every period from 1 through the current one
+  // (or just the one asked for) and merge by transaction id.
+  let periods: number[];
+  if (opts.scoringPeriodId !== undefined) {
+    periods = [opts.scoringPeriodId];
+  } else {
+    const current = (await getLeague(p)).currentScoringPeriod;
+    periods = current ? Array.from({ length: Math.max(1, current) }, (_, i) => i + 1) : [];
+  }
+  const pages = periods.length
+    ? await Promise.all(periods.map((sp) => fetchLeague(p, ["mTransactions2"], { scoringPeriodId: sp })))
+    : [await fetchLeague(p, ["mTransactions2"])]; // no current period reported: fall back to ESPN's default
+  const byId = new Map<string, EspnTransaction>();
+  for (const d of pages)
+    for (const t of (d as unknown as { transactions?: EspnTransaction[] }).transactions || []) byId.set(String(t.id), t);
+  const all = [...byId.values()]
     .filter((t) => t.status === "EXECUTED")
     // most recent first — the typical "what happened lately" use case
     .sort((a, b) => (b.proposedDate ?? 0) - (a.proposedDate ?? 0));
@@ -369,6 +389,31 @@ export async function getPending(p: LeagueParams) {
 // get_player (by id or name search, searches rosters + free agent pool)
 // ---------------------------------------------------------------------------
 
+/** The X-Fantasy-Filter for a name search across the whole player pool
+ *  (every status, rostered or not), most-owned first. */
+export function buildNameSearchFilter(name: string) {
+  return {
+    players: {
+      filterName: { value: name.trim() },
+      limit: 50,
+      sortPercOwned: { sortPriority: 1, sortAsc: false },
+    },
+  };
+}
+
+/** Choose the best hit from a filterName answer: an exact full-name match
+ *  first, else the first (most-owned) entry whose name contains the needle.
+ *  The containment check guards against ESPN ignoring filterName and handing
+ *  back the top of the pool, which would otherwise return a wrong player. */
+export function pickNameMatch<T extends { player: { fullName: string } }>(pool: T[], name: string): T | undefined {
+  const needle = name.trim().toLowerCase();
+  if (!needle) return undefined;
+  return (
+    pool.find((x) => x.player.fullName.toLowerCase() === needle) ??
+    pool.find((x) => x.player.fullName.toLowerCase().includes(needle))
+  );
+}
+
 export async function getPlayer(p: LeagueParams, opts: { id?: number; nameSearch?: string }) {
   if (opts.id !== undefined) {
     const filter = { players: { filterIds: { value: [opts.id] } } };
@@ -386,6 +431,22 @@ export async function getPlayer(p: LeagueParams, opts: { id?: number; nameSearch
     for (const r of rosters) {
       const hit = r.players.find((pl) => pl.name.toLowerCase().includes(needle));
       if (hit) return hit;
+    }
+    // Ask ESPN by name before scanning a slice: scanning only the 200
+    // most-owned free agents made any low-owned player read as nonexistent.
+    // kona_player_info honours filterName over the whole pool, but it matches
+    // name prefixes only, so a mid-word needle still falls through to the
+    // substring scan below.
+    const filter = buildNameSearchFilter(opts.nameSearch);
+    const data = await fetchLeague(p, ["kona_player_info"], {}, { "X-Fantasy-Filter": JSON.stringify(filter) });
+    const pool = ((data as unknown as { players?: Array<{ player: EspnPlayer; onTeamId?: number }> }).players ||
+      []) as Array<{ player: EspnPlayer; onTeamId?: number }>;
+    const picked = pickNameMatch(pool, opts.nameSearch);
+    if (picked) {
+      return normalizePlayer(p.sport, p.season, picked.player, {
+        percentOwned: picked.player.ownership?.percentOwned,
+        teamId: picked.onTeamId ? picked.onTeamId : undefined,
+      });
     }
     const freeAgents = await getFreeAgents(p, { limit: 200 });
     return freeAgents.find((pl) => pl.name.toLowerCase().includes(needle));
