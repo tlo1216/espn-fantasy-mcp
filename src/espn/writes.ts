@@ -197,11 +197,29 @@ export async function waiverClaim(
   );
 }
 
+// A LOCKED PLAYER CANNOT BE DROPPED. Once a player's game for the current
+// scoring period has started, ESPN refuses to release him until the next
+// period, and says so only in its own UI. The API answers with an unrelated
+// 409 ("TransactionType FREEAGENT may only contain one item for MoveType:
+// ADD"), which reads like a malformed body. Refuse first, in plain words. A
+// waiver claim is not refused: it resolves later, after the lock clears.
+export function lockedDropReason(target: { name?: string; locked?: boolean } | undefined, sport: string): string | undefined {
+  if (!target?.locked) return undefined;
+  const when = sport === "ffl" ? "after the week ends (Tuesday)" : "from the next scoring period";
+  return `${target.name ?? "that player"} is locked: his game this scoring period has started, and ESPN refuses to drop a locked player until the period ends. Drop him ${when}, or put him in a waiver_claim, which processes later.`;
+}
+
 export async function addFreeAgent(
   p: LeagueParams,
   args: { teamId: number; addPlayerId: number; dropPlayerId?: number },
   dryRun: boolean,
 ): Promise<WriteOutcome<{ transactions: unknown }>> {
+  if (args.dropPlayerId !== undefined) {
+    const dropTarget = (await teamRoster(p, args.teamId)).find((pl) => pl.id === args.dropPlayerId);
+    const why = lockedDropReason(dropTarget, p.sport);
+    if (why) return { dryRun, blockedReason: why };
+  }
+
   return runAddDrop(
     "add_free_agent",
     { ...p, ...args, dryRun },
