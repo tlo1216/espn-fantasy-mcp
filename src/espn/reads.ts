@@ -1,4 +1,5 @@
 import { getJson, leaguePath } from "./client.js";
+import { safeIso } from "./dates.js";
 import { defaultPositionMap, lineupSlotMap, proTeamMap, type Sport } from "./constants.js";
 import type {
   EspnLeagueResponse,
@@ -125,7 +126,7 @@ export async function getLeague(p: LeagueParams) {
     tradeSettings: s?.tradeSettings
       ? {
           ...s.tradeSettings,
-          deadlineDateIso: new Date(s.tradeSettings.deadlineDate).toISOString(),
+          deadlineDateIso: safeIso(s.tradeSettings.deadlineDate),
         }
       : undefined,
     draftSettings: s?.draftSettings,
@@ -340,7 +341,7 @@ export async function getTransactions(
     teamId: t.teamId,
     type: t.type,
     scoringPeriodId: t.scoringPeriodId,
-    proposedDate: t.proposedDate ? new Date(t.proposedDate).toISOString() : undefined,
+    proposedDate: safeIso(t.proposedDate),
     items: (t.items || []).map((i) => ({
       type: i.type,
       playerId: i.playerId,
