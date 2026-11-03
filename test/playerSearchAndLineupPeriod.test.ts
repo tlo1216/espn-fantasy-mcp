@@ -178,6 +178,13 @@ test("buildLineupBody carries the requested period, not the current one", () => 
   assert.equal(body.scoringPeriodId, 9);
 });
 
+test("a later period is a FUTURE_ROSTER write; the current one stays ROSTER", () => {
+  const base = { teamId: 3, moves: [{ playerId: 1, toSlot: 2 }], currentSlots: new Map([[1, 20]]) };
+  assert.equal(buildLineupBody({ ...base, scoringPeriodId: 9, currentScoringPeriodId: 8 }).type, "FUTURE_ROSTER");
+  assert.equal(buildLineupBody({ ...base, scoringPeriodId: 8, currentScoringPeriodId: 8 }).type, "ROSTER");
+  assert.equal(buildLineupBody({ ...base, scoringPeriodId: 9 }).type, "ROSTER");
+});
+
 function lineupRoute(lockedInCurrent: boolean) {
   return (url: URL) => {
     if (views(url).includes("mRoster")) {

@@ -274,16 +274,25 @@ export async function cancelClaim(
 // swap sends two items, not one.
 // ---------------------------------------------------------------------------
 
+// A later period is a different transaction type. ESPN refuses a ROSTER write
+// for tomorrow with HTTP 409 "Transaction type can only be executed in the
+// current scoring period"; FUTURE_ROSTER is ESPN's own type for a period after
+// the current one.
+export function lineupTransactionType(scoringPeriodId: number, currentScoringPeriodId?: number): "ROSTER" | "FUTURE_ROSTER" {
+  return currentScoringPeriodId !== undefined && scoringPeriodId > currentScoringPeriodId ? "FUTURE_ROSTER" : "ROSTER";
+}
+
 export function buildLineupBody(opts: {
   teamId: number;
   scoringPeriodId: number;
+  currentScoringPeriodId?: number;
   moves: LineupMove[];
   currentSlots: Map<number, number | undefined>;
 }): Record<string, unknown> {
   return {
     isLeagueManager: false,
     teamId: opts.teamId,
-    type: "ROSTER",
+    type: lineupTransactionType(opts.scoringPeriodId, opts.currentScoringPeriodId),
     memberId: memberId(),
     scoringPeriodId: opts.scoringPeriodId,
     executionType: "EXECUTE",
@@ -346,7 +355,7 @@ export async function setLineup(
 
   if (dryRun || !writesEnabled()) {
     const body = validation.valid
-      ? buildLineupBody({ teamId: args.teamId, scoringPeriodId, moves: validation.accepted, currentSlots })
+      ? buildLineupBody({ teamId: args.teamId, scoringPeriodId, currentScoringPeriodId: league.currentScoringPeriod ?? undefined, moves: validation.accepted, currentSlots })
       : undefined;
     return {
       dryRun: true,
@@ -360,7 +369,7 @@ export async function setLineup(
     return { dryRun: false, validation, blockedReason: "One or more moves failed validation; nothing was sent." };
   }
 
-  const body = buildLineupBody({ teamId: args.teamId, scoringPeriodId, moves: validation.accepted, currentSlots });
+  const body = buildLineupBody({ teamId: args.teamId, scoringPeriodId, currentScoringPeriodId: league.currentScoringPeriod ?? undefined, moves: validation.accepted, currentSlots });
 
   const result = await postTransaction(p.sport, p.season, p.leagueId, body);
   const settled = await settle(() => teamRoster(p, args.teamId, asOf), (r) => lineupMismatches(r, validation.accepted));
