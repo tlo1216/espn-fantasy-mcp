@@ -1,4 +1,5 @@
 import { getJson, leaguePath } from "./espn/client.js";
+import { safeIso } from "./espn/dates.js";
 import type { Sport } from "./espn/constants.js";
 import type {
   EspnLeagueResponse,
@@ -101,7 +102,7 @@ export function formatSnapshot(
         `waiverHours=${a.waiverHours}`,
         `processDays=${(a.waiverProcessDays || []).map((d) => d.slice(0, 3)).join(",")}`,
         `processHour=${a.waiverProcessHour}`,
-        `tradeDeadline=${new Date(tr.deadlineDate).toISOString().slice(0, 16).replace("T", " ")}`,
+        `tradeDeadline=${(safeIso(tr.deadlineDate) ?? "").slice(0, 16).replace("T", " ")}`,
         `vetoVotes=${tr.vetoVotesRequired}`,
         `playoffTeams=${sc.playoffTeamCount}`,
         `keepers=${settings.draftSettings.keeperCount ?? 0}`,
