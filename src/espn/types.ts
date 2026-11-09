@@ -5,6 +5,7 @@ export interface EspnStat {
   scoringPeriodId: number; // 0 = season total, N = period N
   seasonId: number;
   appliedTotal?: number;
+  statSplitTypeId?: number;
 }
 
 export interface EspnPlayer {

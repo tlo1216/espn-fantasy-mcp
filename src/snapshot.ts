@@ -1,4 +1,5 @@
 import { getJson, leaguePath } from "./espn/client.js";
+import { SPLIT } from "./espn/reads.js";
 import type { Sport } from "./espn/constants.js";
 import type {
   EspnLeagueResponse,
@@ -24,11 +25,12 @@ export interface SnapshotParams {
   leagueId: string;
 }
 
+// Rest of season: split 0, never the full season split 2 (espn/reads.ts SPLIT).
 function seasonProjection(player: EspnPlayer, season: number): number {
   const stat = (player.stats || []).find(
-    (s) => s.statSourceId === 1 && s.scoringPeriodId === 0 && s.seasonId === season,
+    (s) => s.statSourceId === 1 && s.scoringPeriodId === 0 && s.seasonId === season && s.statSplitTypeId === SPLIT.REST,
   );
-  return stat?.appliedTotal !== undefined ? Math.round(stat.appliedTotal) : 0;
+  return stat?.appliedTotal !== undefined ? Math.round(stat.appliedTotal * 100) / 100 : 0;
 }
 
 export async function buildSnapshot(p: SnapshotParams): Promise<string> {

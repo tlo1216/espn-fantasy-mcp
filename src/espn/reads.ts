@@ -55,19 +55,31 @@ export interface NormalizedPlayer {
   teamId?: number;
 }
 
+// ESPN's stat splits. For a season total (scoringPeriodId 0) split 0 is what a
+// player has left once week one is played (the preseason total before it) and
+// split 2 is a full season total; weekly rows are split 1. Measured mid-season:
+// split 0 over a player's weekly projection lands on the games he has left,
+// split 2 on a whole season.
+export const SPLIT = { REST: 0, WEEK: 1, FULL: 2 } as const;
+
 function statValue(
   player: EspnPlayer,
   statSourceId: number,
   scoringPeriodId: number,
   seasonId: number,
+  statSplitTypeId: number,
 ): number | undefined {
+  // The split is pinned: several rows share source, period and season, and an
+  // unpinned find() returns whichever ESPN lists first, which is not stable.
   const stat = (player.stats || []).find(
     (s) =>
       s.statSourceId === statSourceId &&
       s.scoringPeriodId === scoringPeriodId &&
-      s.seasonId === seasonId,
+      s.seasonId === seasonId &&
+      s.statSplitTypeId === statSplitTypeId,
   );
-  return stat?.appliedTotal !== undefined ? Math.round(stat.appliedTotal) : undefined;
+  // Two decimals, not whole points: matchups are decided in tenths.
+  return stat?.appliedTotal !== undefined ? Math.round(stat.appliedTotal * 100) / 100 : undefined;
 }
 
 export function normalizePlayer(
@@ -97,9 +109,9 @@ export function normalizePlayer(
       opts.lineupSlotId !== undefined ? (slotMap[opts.lineupSlotId] ?? String(opts.lineupSlotId)) : undefined,
     injuryStatus: player.injuryStatus,
     locked: opts.locked,
-    seasonProjection: statValue(player, 1, 0, season) ?? 0,
-    periodProjection: opts.periodId !== undefined ? statValue(player, 1, opts.periodId, season) : undefined,
-    periodActual: opts.periodId !== undefined ? statValue(player, 0, opts.periodId, season) : undefined,
+    seasonProjection: statValue(player, 1, 0, season, SPLIT.REST) ?? 0,
+    periodProjection: opts.periodId !== undefined ? statValue(player, 1, opts.periodId, season, SPLIT.WEEK) : undefined,
+    periodActual: opts.periodId !== undefined ? statValue(player, 0, opts.periodId, season, SPLIT.WEEK) : undefined,
     percentOwned: opts.percentOwned !== undefined ? Math.round(opts.percentOwned) : undefined,
     teamId: opts.teamId,
   };

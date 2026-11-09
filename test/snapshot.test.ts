@@ -13,7 +13,9 @@ function makePlayer(id: number, fullName: string, injuryStatus: string, seasonPr
     proTeamId: 12,
     eligibleSlots: [2, 23, 20],
     injuryStatus,
-    stats: [{ statSourceId: 1, scoringPeriodId: 0, seasonId: SEASON, appliedTotal: seasonProj }],
+    // Split 0 is the rest of season; a full season split 2 sits beside it and must not be read.
+    stats: [{ statSourceId: 1, scoringPeriodId: 0, seasonId: SEASON, statSplitTypeId: 2, appliedTotal: seasonProj * 1.6 },
+      { statSourceId: 1, scoringPeriodId: 0, seasonId: SEASON, statSplitTypeId: 0, appliedTotal: seasonProj }],
   };
 }
 
